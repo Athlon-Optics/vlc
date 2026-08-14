@@ -95,6 +95,10 @@ static void Close( vlc_object_t * );
     "track, can be increased in case of broken pictures due " \
     "to too small buffer.")
 #define DEFAULT_FRAME_BUFFER_SIZE 250000
+#define LIVE_TIMESTAMPS_TEXT N_("Use local arrival time for live RTP timestamps")
+#define LIVE_TIMESTAMPS_LONGTEXT N_("Generate presentation timestamps from the " \
+    "local monotonic arrival clock. This is intended for live RTSP senders " \
+    "whose RTP timestamp progression does not match the advertised clock rate.")
 
 vlc_module_begin ()
     set_description( N_("RTP/RTSP/SDP demuxer (using Live555)" ) )
@@ -136,6 +140,9 @@ vlc_module_begin ()
         add_password("rtsp-pwd", NULL, PASS_TEXT, PASS_LONGTEXT)
         add_integer( "rtsp-frame-buffer-size", DEFAULT_FRAME_BUFFER_SIZE,
                      FRAME_BUFFER_SIZE_TEXT, FRAME_BUFFER_SIZE_LONGTEXT )
+        add_bool( "rtsp-live-timestamps", false,
+                  LIVE_TIMESTAMPS_TEXT, LIVE_TIMESTAMPS_LONGTEXT )
+            change_safe()
 vlc_module_end ()
 
 
@@ -174,6 +181,12 @@ typedef struct
     char            waiting;
     vlc_tick_t      i_prevpts;
     vlc_tick_t      i_pcr;
+    bool            b_have_arrival_timestamp;
+    vlc_tick_t      i_last_frame_raw_pts;
+    vlc_tick_t      i_last_arrival_pts;
+    vlc_tick_t      i_last_trace_time;
+    vlc_tick_t      i_last_trace_raw_pts;
+    vlc_tick_t      i_last_trace_arrival_pts;
     double          f_npt;
 
     struct dtsgen_t dtsgen;
@@ -223,6 +236,7 @@ struct demux_sys_t
     /* */
     vlc_tick_t       i_pcr; /* The clock */
     bool             b_rtcp_sync; /* At least one track received sync */
+    bool             b_live_timestamps;
     double           f_npt;
     double           f_npt_length;
     double           f_npt_start;
@@ -403,6 +417,7 @@ static int  Open ( vlc_object_t *p_this )
     TAB_INIT( p_sys->i_track, p_sys->track );
     p_sys->b_no_data = true;
     p_sys->b_force_mcast = var_InheritBool( p_demux, "rtsp-mcast" );
+    p_sys->b_live_timestamps = var_InheritBool( p_demux, "rtsp-live-timestamps" );
     p_sys->f_seek_request = -1;
 
     /* parse URL for rtsp://[user:[passwd]@]serverip:port/options */
@@ -922,6 +937,12 @@ static int SessionsSetup( demux_t *p_demux )
             tk->i_next_block_flags = 0;
             tk->i_prevpts   = VLC_TICK_INVALID;
             tk->i_pcr       = VLC_TICK_INVALID;
+            tk->b_have_arrival_timestamp = false;
+            tk->i_last_frame_raw_pts = VLC_TICK_INVALID;
+            tk->i_last_arrival_pts = VLC_TICK_INVALID;
+            tk->i_last_trace_time = VLC_TICK_INVALID;
+            tk->i_last_trace_raw_pts = VLC_TICK_INVALID;
+            tk->i_last_trace_arrival_pts = VLC_TICK_INVALID;
             tk->f_npt       = 0.;
             dtsgen_Init( &tk->dtsgen );
             tk->state       = live_track_t::STATE_SELECTED;
@@ -1987,7 +2008,48 @@ static void StreamRead( void *p_private, unsigned int i_size,
 
     //msg_Dbg( p_demux, "pts: %d", pts.tv_sec );
 
-    vlc_tick_t i_pts = vlc_tick_from_timeval( &pts );
+    const vlc_tick_t i_raw_pts = vlc_tick_from_timeval( &pts );
+    vlc_tick_t i_pts = i_raw_pts;
+    if( p_sys->b_live_timestamps && tk->sub->rtpSource() != NULL )
+    {
+        const vlc_tick_t i_now = vlc_tick_now();
+
+        if( !tk->b_have_arrival_timestamp )
+        {
+            tk->b_have_arrival_timestamp = true;
+            tk->i_last_frame_raw_pts = i_raw_pts;
+            tk->i_last_arrival_pts = i_now;
+        }
+        else if( i_raw_pts != tk->i_last_frame_raw_pts )
+        {
+            tk->i_last_frame_raw_pts = i_raw_pts;
+            tk->i_last_arrival_pts = i_now > tk->i_last_arrival_pts
+                                   ? i_now : tk->i_last_arrival_pts + 1;
+        }
+        i_pts = tk->i_last_arrival_pts;
+
+        if( tk->i_last_trace_time == VLC_TICK_INVALID ||
+            i_now - tk->i_last_trace_time >= VLC_TICK_FROM_SEC( 1 ) )
+        {
+            const vlc_tick_t i_raw_delta =
+                tk->i_last_trace_raw_pts == VLC_TICK_INVALID ? 0
+                                                             : i_raw_pts - tk->i_last_trace_raw_pts;
+            const vlc_tick_t i_arrival_delta =
+                tk->i_last_trace_arrival_pts == VLC_TICK_INVALID ? 0
+                    : i_pts - tk->i_last_trace_arrival_pts;
+            msg_Dbg( p_demux,
+                     "live timestamp raw_pts=%" PRId64 " ms clock=%u raw_delta=%" PRId64
+                     " ms arrival_delta=%" PRId64 " ms repaired_pts=%" PRId64
+                     " ms schedule_lag=%" PRId64 " ms",
+                     MS_FROM_VLC_TICK( i_raw_pts ), tk->sub->rtpTimestampFrequency(),
+                     MS_FROM_VLC_TICK( i_raw_delta ), MS_FROM_VLC_TICK( i_arrival_delta ),
+                     MS_FROM_VLC_TICK( i_pts ),
+                     MS_FROM_VLC_TICK( i_now - i_pts ) );
+            tk->i_last_trace_time = i_now;
+            tk->i_last_trace_raw_pts = i_raw_pts;
+            tk->i_last_trace_arrival_pts = i_pts;
+        }
+    }
 
     /* XXX Beurk beurk beurk Avoid having negative value XXX */
     i_pts &= INT64_C(0x00ffffffffffffff);
