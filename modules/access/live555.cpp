@@ -99,6 +99,12 @@ static void Close( vlc_object_t * );
 #define LIVE_TIMESTAMPS_LONGTEXT N_("Generate presentation timestamps from the " \
     "local monotonic arrival clock. This is intended for live RTSP senders " \
     "whose RTP timestamp progression does not match the advertised clock rate.")
+#define LIVE_GAP_TIMEOUT_TEXT N_("Live RTP recovery timeout")
+#define LIVE_GAP_TIMEOUT_LONGTEXT N_("Maximum number of seconds to wait for RTP " \
+    "to resume in the current RTSP session after playback has started. This is " \
+    "used only with local live timestamps and does not reconnect the session.")
+#define DEFAULT_LIVE_GAP_TIMEOUT 10
+#define LIVE_GAP_RECOVERY_THRESHOLD VLC_TICK_FROM_SEC( 1 )
 
 vlc_module_begin ()
     set_description( N_("RTP/RTSP/SDP demuxer (using Live555)" ) )
@@ -143,6 +149,10 @@ vlc_module_begin ()
         add_bool( "rtsp-live-timestamps", false,
                   LIVE_TIMESTAMPS_TEXT, LIVE_TIMESTAMPS_LONGTEXT )
             change_safe()
+        add_integer( "rtsp-live-gap-timeout", DEFAULT_LIVE_GAP_TIMEOUT,
+                     LIVE_GAP_TIMEOUT_TEXT, LIVE_GAP_TIMEOUT_LONGTEXT )
+            change_integer_range( DEFAULT_LIVE_GAP_TIMEOUT, 120 )
+            change_safe()
 vlc_module_end ()
 
 
@@ -176,6 +186,7 @@ typedef struct
     size_t          i_buffer;
 
     bool            b_rtcp_sync;
+    bool            b_ignored_rtcp_sync;
     bool            b_flushing_discontinuity;
     int             i_next_block_flags;
     char            waiting;
@@ -237,6 +248,9 @@ struct demux_sys_t
     vlc_tick_t       i_pcr; /* The clock */
     bool             b_rtcp_sync; /* At least one track received sync */
     bool             b_live_timestamps;
+    vlc_tick_t       i_live_gap_timeout;
+    vlc_tick_t       i_last_data_time;
+    vlc_tick_t       i_last_gap_log_time;
     double           f_npt;
     double           f_npt_length;
     double           f_npt_start;
@@ -418,6 +432,10 @@ static int  Open ( vlc_object_t *p_this )
     p_sys->b_no_data = true;
     p_sys->b_force_mcast = var_InheritBool( p_demux, "rtsp-mcast" );
     p_sys->b_live_timestamps = var_InheritBool( p_demux, "rtsp-live-timestamps" );
+    p_sys->i_live_gap_timeout = vlc_tick_from_sec(
+        var_InheritInteger( p_demux, "rtsp-live-gap-timeout" ) );
+    p_sys->i_last_data_time = VLC_TICK_INVALID;
+    p_sys->i_last_gap_log_time = VLC_TICK_INVALID;
     p_sys->f_seek_request = -1;
 
     /* parse URL for rtsp://[user:[passwd]@]serverip:port/options */
@@ -933,6 +951,7 @@ static int SessionsSetup( demux_t *p_demux )
             tk->p_out_muxed = NULL;
             tk->waiting     = 0;
             tk->b_rtcp_sync = false;
+            tk->b_ignored_rtcp_sync = false;
             tk->b_flushing_discontinuity = false;
             tk->i_next_block_flags = 0;
             tk->i_prevpts   = VLC_TICK_INVALID;
@@ -1320,6 +1339,8 @@ static int SessionsSetup( demux_t *p_demux )
     p_sys->i_no_data_ti = 0;
     p_sys->b_rtcp_sync = false;
     p_sys->i_pcr = VLC_TICK_INVALID;
+    p_sys->i_last_data_time = VLC_TICK_INVALID;
+    p_sys->i_last_gap_log_time = VLC_TICK_INVALID;
 
     return i_return;
 }
@@ -1577,6 +1598,35 @@ static int Demux( demux_t *p_demux )
     else if( !p_sys->b_multicast && !p_sys->b_paused &&
              ( p_sys->i_no_data_ti > 34 ) )
     {
+        if( p_sys->b_live_timestamps &&
+            p_sys->i_last_data_time != VLC_TICK_INVALID )
+        {
+            const vlc_tick_t i_now = vlc_tick_now();
+            const vlc_tick_t i_gap = i_now - p_sys->i_last_data_time;
+
+            if( i_gap < p_sys->i_live_gap_timeout )
+            {
+                if( p_sys->i_last_gap_log_time == VLC_TICK_INVALID ||
+                    i_now - p_sys->i_last_gap_log_time >= VLC_TICK_FROM_SEC( 10 ) )
+                {
+                    msg_Warn( p_demux,
+                              "no live RTP data for %" PRId64 " ms; waiting in the "
+                              "current RTSP session (timeout=%" PRId64 " ms)",
+                              MS_FROM_VLC_TICK( i_gap ),
+                              MS_FROM_VLC_TICK( p_sys->i_live_gap_timeout ) );
+                    p_sys->i_last_gap_log_time = i_now;
+                }
+                return VLC_DEMUXER_SUCCESS;
+            }
+
+            msg_Err( p_demux,
+                     "no live RTP data for %" PRId64 " ms; current-session "
+                     "recovery timeout reached (%" PRId64 " ms)",
+                     MS_FROM_VLC_TICK( i_gap ),
+                     MS_FROM_VLC_TICK( p_sys->i_live_gap_timeout ) );
+            return VLC_DEMUXER_EOF;
+        }
+
         /* EOF ? */
         msg_Warn( p_demux, "no data received in 10s, eof ?" );
         return VLC_DEMUXER_EOF;
@@ -2014,6 +2064,30 @@ static void StreamRead( void *p_private, unsigned int i_size,
     {
         const vlc_tick_t i_now = vlc_tick_now();
 
+        if( p_sys->i_last_data_time != VLC_TICK_INVALID &&
+            i_now - p_sys->i_last_data_time >= LIVE_GAP_RECOVERY_THRESHOLD )
+        {
+            const vlc_tick_t i_gap = i_now - p_sys->i_last_data_time;
+            msg_Warn( p_demux,
+                      "live RTP resumed after %" PRId64 " ms; resetting the local "
+                      "timeline in the current RTSP session",
+                      MS_FROM_VLC_TICK( i_gap ) );
+            es_out_Control( p_demux->out, ES_OUT_RESET_PCR );
+            p_sys->i_pcr = VLC_TICK_INVALID;
+            p_sys->b_rtcp_sync = false;
+
+            for( int i = 0; i < p_sys->i_track; ++i )
+            {
+                live_track_t *reset_tk = p_sys->track[i];
+                reset_tk->i_prevpts = VLC_TICK_INVALID;
+                reset_tk->i_pcr = VLC_TICK_INVALID;
+                reset_tk->b_flushing_discontinuity = false;
+                reset_tk->i_next_block_flags |= BLOCK_FLAG_DISCONTINUITY;
+                reset_tk->b_have_arrival_timestamp = false;
+                dtsgen_Resync( &reset_tk->dtsgen );
+            }
+        }
+
         if( !tk->b_have_arrival_timestamp )
         {
             tk->b_have_arrival_timestamp = true;
@@ -2204,18 +2278,28 @@ static void StreamRead( void *p_private, unsigned int i_size,
     }
 
     /* No data sent. Always in sync then */
-    if( !tk->b_rtcp_sync && tk->sub->rtpSource() &&
+    if( !tk->b_rtcp_sync && !tk->b_ignored_rtcp_sync &&
+         tk->sub->rtpSource() &&
          tk->sub->rtpSource()->hasBeenSynchronizedUsingRTCP() )
     {
-        msg_Dbg( p_demux, "tk->rtpSource->hasBeenSynchronizedUsingRTCP()" );
-        p_sys->b_rtcp_sync = tk->b_rtcp_sync = true;
-        if( tk->i_pcr != VLC_TICK_INVALID )
+        if( p_sys->b_live_timestamps )
         {
-            tk->i_next_block_flags |= BLOCK_FLAG_DISCONTINUITY;
-            const vlc_tick_t i_max_diff = vlc_tick_from_sec(( tk->fmt.i_cat == SPU_ES ) ? 60 : 1);
-            tk->b_flushing_discontinuity = (llabs(i_pts - tk->i_pcr) > i_max_diff);
-            tk->i_pcr = i_pts;
-            tk->dtsgen.count = 0;
+            tk->b_ignored_rtcp_sync = true;
+            msg_Dbg( p_demux,
+                     "ignoring RTCP sender-report timeline for local live timestamps" );
+        }
+        else
+        {
+            msg_Dbg( p_demux, "tk->rtpSource->hasBeenSynchronizedUsingRTCP()" );
+            p_sys->b_rtcp_sync = tk->b_rtcp_sync = true;
+            if( tk->i_pcr != VLC_TICK_INVALID )
+            {
+                tk->i_next_block_flags |= BLOCK_FLAG_DISCONTINUITY;
+                const vlc_tick_t i_max_diff = vlc_tick_from_sec(( tk->fmt.i_cat == SPU_ES ) ? 60 : 1);
+                tk->b_flushing_discontinuity = (llabs(i_pts - tk->i_pcr) > i_max_diff);
+                tk->i_pcr = i_pts;
+                tk->dtsgen.count = 0;
+            }
         }
     }
 
@@ -2267,7 +2351,8 @@ static void StreamRead( void *p_private, unsigned int i_size,
                     tk->i_next_block_flags = 0;
                 }
 
-                vlc_tick_t i_pcr = p_block->i_dts > VLC_TICK_INVALID ? p_block->i_dts : p_block->i_pts;
+                vlc_tick_t i_pcr = p_sys->b_live_timestamps ? p_block->i_pts :
+                    (p_block->i_dts > VLC_TICK_INVALID ? p_block->i_dts : p_block->i_pts);
                 es_out_Send( p_demux->out, tk->p_es, p_block );
                 if( i_pcr > VLC_TICK_INVALID )
                 {
@@ -2285,6 +2370,11 @@ static void StreamRead( void *p_private, unsigned int i_size,
     tk->waiting = 0;
     p_sys->b_no_data = false;
     p_sys->i_no_data_ti = 0;
+    if( p_sys->b_live_timestamps )
+    {
+        p_sys->i_last_data_time = vlc_tick_now();
+        p_sys->i_last_gap_log_time = VLC_TICK_INVALID;
+    }
 }
 
 /*****************************************************************************
