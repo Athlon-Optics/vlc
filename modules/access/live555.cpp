@@ -2069,8 +2069,9 @@ static void StreamRead( void *p_private, unsigned int i_size,
         {
             const vlc_tick_t i_gap = i_now - p_sys->i_last_data_time;
             msg_Warn( p_demux,
-                      "live RTP resumed after %" PRId64 " ms; resetting the local "
-                      "timeline in the current RTSP session",
+                      "live RTP resumed reason=gap-recovery gap=%" PRId64
+                      " ms; resetting the local timeline in the current RTSP "
+                      "session",
                       MS_FROM_VLC_TICK( i_gap ) );
             es_out_Control( p_demux->out, ES_OUT_RESET_PCR );
             p_sys->i_pcr = VLC_TICK_INVALID;

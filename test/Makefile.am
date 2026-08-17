@@ -68,6 +68,7 @@ check_PROGRAMS = \
 	test_src_misc_image \
 	test_src_misc_viewpoint \
 	test_src_video_output \
+	test_src_video_output_live_edge \
 	test_src_video_output_opengl \
 	test_modules_lua_extension \
 	test_modules_lua_playlist_parser \
@@ -309,6 +310,7 @@ test_src_video_output_SOURCES = \
 	src/video_output/video_output.h \
 	src/video_output/video_output_scenarios.c
 test_src_video_output_LDADD = $(LIBVLCCORE) $(LIBVLC)
+test_src_video_output_live_edge_SOURCES = src/video_output/live_edge.c
 test_src_video_output_opengl_SOURCES = src/video_output/opengl.c
 test_src_video_output_opengl_LDADD = $(LIBVLCCORE) $(LIBVLC)
 

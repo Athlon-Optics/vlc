@@ -531,6 +531,12 @@ static const char *const fit_descriptions[] = {
 #define DROP_LATE_FRAMES_LONGTEXT N_( \
     "This drops frames that are late (arrive to the video output after " \
     "their intended display date)." )
+#define X10_LIVE_MAX_DELAY_TEXT N_("X10 live video maximum delay")
+#define X10_LIVE_MAX_DELAY_LONGTEXT N_( \
+    "Maximum age in milliseconds for decoded X10 live video pictures whose " \
+    "timestamps use the local monotonic arrival clock. Pictures older than " \
+    "this limit are dropped only while newer pictures are queued. Set to 0 " \
+    "to disable this behavior." )
 
 #define KEYBOARD_EVENTS_TEXT N_("Key press events")
 #define KEYBOARD_EVENTS_LONGTEXT N_( \
@@ -1674,6 +1680,10 @@ vlc_module_begin ()
         change_private ()
     add_bool( "drop-late-frames", true, DROP_LATE_FRAMES_TEXT,
               DROP_LATE_FRAMES_LONGTEXT )
+    add_integer( "x10-live-max-delay", 0, X10_LIVE_MAX_DELAY_TEXT,
+                 X10_LIVE_MAX_DELAY_LONGTEXT )
+        change_integer_range( 0, 2000 )
+        change_safe ()
     /* Used in vout_synchro */
     add_obsolete_bool( "skip-frames" ) /* since 4.0.0 */
     add_obsolete_bool( "quiet-synchro" ) /* since 4.0.0 */

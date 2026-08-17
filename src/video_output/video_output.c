@@ -65,6 +65,7 @@
 #include "statistic.h"
 #include "chrono.h"
 #include "control.h"
+#include "live_edge.h"
 
 typedef struct vout_thread_sys_t
 {
@@ -136,6 +137,11 @@ typedef struct vout_thread_sys_t
 
     /* */
     bool            is_late_dropped;
+
+    struct {
+        vlc_tick_t  max_delay;
+        vout_live_edge_state_t state;
+    } live_edge;
 
     /* */
     vlc_mouse_t     mouse;
@@ -1032,7 +1038,8 @@ static bool IsPictureLateToProcess(vout_thread_sys_t *vout, const video_format_t
         if (tracer != NULL)
             vlc_tracer_TraceEvent(tracer, "RENDER", sys->str_id, "toolate");
 
-        msg_Warn(&vout->obj, "picture is too late to be displayed (missing %"PRId64" ms)", MS_FROM_VLC_TICK(late));
+        msg_Warn(&vout->obj, "picture drop reason=render-late missing=%"PRId64
+                 " ms", MS_FROM_VLC_TICK(late));
         return true;
     }
     return false;
@@ -1052,6 +1059,56 @@ static bool IsPictureLateToStaticFilter(vout_thread_sys_t *vout,
         vout_chrono_GetHigh(&sys->chrono.render) +
         vout_chrono_GetHigh(&sys->chrono.static_filter);
     return IsPictureLateToProcess(vout, &static_es->video, time_until_display, prepare_decoded_duration);
+}
+
+static void LiveEdgeResetCatchUp(vout_thread_sys_t *sys)
+{
+    vout_live_edge_ResetCatchUp(&sys->live_edge.state);
+}
+
+static void LiveEdgeTraceDrop(vout_thread_sys_t *sys, vlc_tick_t system_now,
+                              vlc_tick_t source_age, vlc_tick_t clock_lateness,
+                              size_t queue_depth)
+{
+    if (vout_live_edge_NoteDrop(&sys->live_edge.state, system_now))
+    {
+        msg_Dbg(&sys->obj,
+                "x10 live-edge drop reason=live-edge-age source_age=%" PRId64
+                " ms clock_lateness=%" PRId64 " ms queue_depth=%zu max_delay=%"
+                PRId64 " ms dropped_total=%" PRIu64 " dropped_consecutive=%u",
+                MS_FROM_VLC_TICK(source_age), MS_FROM_VLC_TICK(clock_lateness),
+                queue_depth, MS_FROM_VLC_TICK(sys->live_edge.max_delay),
+                sys->live_edge.state.dropped_total,
+                sys->live_edge.state.dropped_consecutive);
+    }
+}
+
+static void LiveEdgeTraceCatchUpEnd(vout_thread_sys_t *sys,
+                                    const picture_t *decoded,
+                                    vlc_tick_t system_now, size_t newer_queued)
+{
+    if (sys->live_edge.state.dropped_consecutive == 0)
+        return;
+
+    const bool valid_arrival_pts = !decoded->b_force &&
+        decoded->date != VLC_TICK_INVALID && decoded->date > VLC_TICK_0 &&
+        decoded->date <= system_now;
+    const vlc_tick_t source_age = valid_arrival_pts
+        ? system_now - decoded->date : VLC_TICK_INVALID;
+    const char *reason = valid_arrival_pts &&
+        source_age <= sys->live_edge.max_delay ? "within-limit" :
+        newer_queued == 0 ? "no-newer-picture" : "non-live-picture";
+
+    msg_Dbg(&sys->obj,
+            "x10 live-edge catch-up ended reason=%s source_age=%" PRId64
+            " ms queue_depth=%zu max_delay=%" PRId64
+            " ms dropped_consecutive=%u dropped_total=%" PRIu64,
+            reason,
+            source_age == VLC_TICK_INVALID ? -1 : MS_FROM_VLC_TICK(source_age),
+            newer_queued + 1, MS_FROM_VLC_TICK(sys->live_edge.max_delay),
+            sys->live_edge.state.dropped_consecutive,
+            sys->live_edge.state.dropped_total);
+    vout_live_edge_EndCatchUp(&sys->live_edge.state);
 }
 
 /* */
@@ -1076,6 +1133,7 @@ static picture_t *PreparePicture(vout_thread_sys_t *vout, bool reuse_decoded,
         } else {
             picture_fifo_Lock(sys->decoder_fifo);
             decoded = picture_fifo_Pop(sys->decoder_fifo);
+            const size_t newer_queued = picture_fifo_GetCount(sys->decoder_fifo);
             picture_fifo_Unlock(sys->decoder_fifo);
             if (decoded == NULL)
                 break;
@@ -1092,6 +1150,7 @@ static picture_t *PreparePicture(vout_thread_sys_t *vout, bool reuse_decoded,
                 if (clock_id != sys->clock_id)
                 {
                     sys->clock_id = clock_id;
+                    LiveEdgeResetCatchUp(sys);
                     msg_Dbg(&vout->obj, "Using a new clock context (%u), "
                             "flusing static filters", clock_id);
 
@@ -1101,6 +1160,21 @@ static picture_t *PreparePicture(vout_thread_sys_t *vout, bool reuse_decoded,
                      * FIXME: Pass a discontinuity flag and handle it in
                      * deinterlace modules. */
                     filter_chain_VideoFlush(sys->filter.chain_static);
+                }
+
+                vlc_tick_t source_age;
+                if (vout_live_edge_ShouldDrop(sys->live_edge.max_delay,
+                                              system_now, decoded->date,
+                                              decoded->b_force, newer_queued,
+                                              &source_age))
+                {
+                    LiveEdgeTraceDrop(sys, system_now, source_age,
+                                      system_now - system_pts,
+                                      newer_queued + 1);
+                    picture_Release(decoded);
+                    vout_statistic_AddLost(&sys->statistic, 1);
+                    filter_chain_VideoFlush(sys->filter.chain_static);
+                    continue;
                 }
 
                 if (is_late_dropped
@@ -1115,6 +1189,8 @@ static picture_t *PreparePicture(vout_thread_sys_t *vout, bool reuse_decoded,
                     continue;
                 }
             }
+
+            LiveEdgeTraceCatchUpEnd(sys, decoded, vlc_tick_now(), newer_queued);
 
             if (!VideoFormatIsCropArEqual(&decoded->format, &sys->filter.src_fmt))
             {
@@ -1738,6 +1814,7 @@ static void vout_FlushUnlocked(vout_thread_sys_t *vout, bool below,
     vout_thread_sys_t *sys = vout;
 
     FilterFlush(vout, false); /* FIXME too much */
+    LiveEdgeResetCatchUp(sys);
 
     picture_t *last = sys->displayed.decoded;
     if (last) {
@@ -2268,6 +2345,9 @@ vout_thread_t *vout_Create(vlc_object_t *object)
     vout_InitInterlacingSupport(vout, &sys->interlacing);
 
     sys->is_late_dropped = var_InheritBool(vout, "drop-late-frames");
+    sys->live_edge.max_delay = VLC_TICK_FROM_MS(
+        var_InheritInteger(vout, "x10-live-max-delay"));
+    vout_live_edge_Init(&sys->live_edge.state);
 
     vlc_mutex_init(&sys->filter.lock);
 

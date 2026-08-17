@@ -339,6 +339,12 @@ vlc_tests += {
 }
 
 vlc_tests += {
+    'name' : 'test_src_video_output_live_edge',
+    'sources' : files('video_output/live_edge.c'),
+    'suite' : ['src', 'test_src']
+}
+
+vlc_tests += {
     'name' : 'test_src_video_output_opengl',
     'sources' : files('video_output/opengl.c'),
     'suite' : ['src', 'test_src'],
