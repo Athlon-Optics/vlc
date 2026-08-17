@@ -844,6 +844,56 @@ static void ThreadChangeFilters(vout_thread_t *vout,
 }
 
 
+static void LiveEdgeResetCatchUp(vout_thread_t *vout)
+{
+    vout_live_edge_ResetCatchUp(&vout->p->live_edge.state);
+}
+
+static void LiveEdgeTraceDrop(vout_thread_t *vout, vlc_tick_t system_now,
+                              vlc_tick_t source_age, vlc_tick_t clock_lateness,
+                              size_t queue_depth)
+{
+    if (vout_live_edge_NoteDrop(&vout->p->live_edge.state, system_now))
+    {
+        msg_Dbg(vout,
+                "x10 live-edge drop reason=live-edge-age source_age=%" PRId64
+                " ms clock_lateness=%" PRId64 " ms queue_depth=%zu max_delay=%"
+                PRId64 " ms dropped_total=%" PRIu64 " dropped_consecutive=%u",
+                MS_FROM_VLC_TICK(source_age), MS_FROM_VLC_TICK(clock_lateness),
+                queue_depth, MS_FROM_VLC_TICK(vout->p->live_edge.max_delay),
+                vout->p->live_edge.state.dropped_total,
+                vout->p->live_edge.state.dropped_consecutive);
+    }
+}
+
+static void LiveEdgeTraceCatchUpEnd(vout_thread_t *vout,
+                                    const picture_t *decoded,
+                                    vlc_tick_t system_now, size_t newer_queued)
+{
+    if (vout->p->live_edge.state.dropped_consecutive == 0)
+        return;
+
+    const bool valid_arrival_pts = !decoded->b_force &&
+        decoded->date != VLC_TICK_INVALID && decoded->date > VLC_TICK_0 &&
+        decoded->date <= system_now;
+    const vlc_tick_t source_age = valid_arrival_pts
+        ? system_now - decoded->date : VLC_TICK_INVALID;
+    const char *reason = valid_arrival_pts &&
+        source_age <= vout->p->live_edge.max_delay ? "within-limit" :
+        newer_queued == 0 ? "no-newer-picture" : "non-live-picture";
+
+    msg_Dbg(vout,
+            "x10 live-edge catch-up ended reason=%s source_age=%" PRId64
+            " ms queue_depth=%zu max_delay=%" PRId64
+            " ms dropped_consecutive=%u dropped_total=%" PRIu64,
+            reason,
+            source_age == VLC_TICK_INVALID ? -1 : MS_FROM_VLC_TICK(source_age),
+            newer_queued + 1, MS_FROM_VLC_TICK(vout->p->live_edge.max_delay),
+            vout->p->live_edge.state.dropped_consecutive,
+            vout->p->live_edge.state.dropped_total);
+    vout_live_edge_EndCatchUp(&vout->p->live_edge.state);
+}
+
 /* */
 static int ThreadDisplayPreparePicture(vout_thread_t *vout, bool reuse, bool frame_by_frame)
 {
@@ -860,7 +910,23 @@ static int ThreadDisplayPreparePicture(vout_thread_t *vout, bool reuse, bool fra
             decoded = picture_Hold(vout->p->displayed.decoded);
         } else {
             decoded = picture_fifo_Pop(vout->p->decoder_fifo);
+            const size_t newer_queued =
+                picture_fifo_GetCount(vout->p->decoder_fifo);
             if (decoded) {
+                const vlc_tick_t system_now = mdate();
+                vlc_tick_t source_age;
+                if (vout_live_edge_ShouldDrop(vout->p->live_edge.max_delay,
+                                              system_now, decoded->date,
+                                              decoded->b_force, newer_queued,
+                                              &source_age)) {
+                    LiveEdgeTraceDrop(vout, system_now, source_age, source_age,
+                                      newer_queued + 1);
+                    picture_Release(decoded);
+                    vout_statistic_AddLost(&vout->p->statistic, 1);
+                    filter_chain_VideoFlush(vout->p->filter.chain_static);
+                    continue;
+                }
+
                 if (is_late_dropped && !decoded->b_force) {
                     vlc_tick_t late_threshold;
                     if (decoded->format.i_frame_rate && decoded->format.i_frame_rate_base)
@@ -870,7 +936,8 @@ static int ThreadDisplayPreparePicture(vout_thread_t *vout, bool reuse, bool fra
                     const vlc_tick_t predicted = mdate() + 0; /* TODO improve */
                     const vlc_tick_t late = predicted - decoded->date;
                     if (late > late_threshold) {
-                        msg_Warn(vout, "picture is too late to be displayed (missing %"PRId64" ms)", late/1000);
+                        msg_Warn(vout, "picture drop reason=render-late missing=%"
+                                 PRId64 " ms", MS_FROM_VLC_TICK(late));
                         picture_Release(decoded);
                         vout_statistic_AddLost(&vout->p->statistic, 1);
                         continue;
@@ -878,6 +945,7 @@ static int ThreadDisplayPreparePicture(vout_thread_t *vout, bool reuse, bool fra
                         msg_Dbg(vout, "picture might be displayed late (missing %"PRId64" ms)", late/1000);
                     }
                 }
+                LiveEdgeTraceCatchUpEnd(vout, decoded, mdate(), newer_queued);
                 if (!VideoFormatIsCropArEqual(&decoded->format, &vout->p->filter.format))
                     ThreadChangeFilters(vout, &decoded->format, vout->p->filter.configuration, -1, true);
             }
@@ -1322,6 +1390,7 @@ static void ThreadFlush(vout_thread_t *vout, bool below, vlc_tick_t date)
     vout->p->step.last      = VLC_TICK_INVALID;
 
     ThreadFilterFlush(vout, false); /* FIXME too much */
+    LiveEdgeResetCatchUp(vout);
 
     picture_t *last = vout->p->displayed.decoded;
     if (last) {
@@ -1598,6 +1667,9 @@ static void ThreadInit(vout_thread_t *vout)
 {
     vout->p->dead            = false;
     vout->p->is_late_dropped = var_InheritBool(vout, "drop-late-frames");
+    vout->p->live_edge.max_delay = VLC_TICK_FROM_MS(
+        var_InheritInteger(vout, "x10-live-max-delay"));
+    vout_live_edge_Init(&vout->p->live_edge.state);
     vout->p->pause.is_on     = false;
     vout->p->pause.date      = VLC_TICK_INVALID;
 

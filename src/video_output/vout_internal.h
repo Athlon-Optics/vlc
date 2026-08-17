@@ -34,6 +34,7 @@
 #include "snapshot.h"
 #include "statistic.h"
 #include "chrono.h"
+#include "live_edge.h"
 
 /* It should be high enough to absorbe jitter due to difficult picture(s)
  * to decode but not too high as memory is not that cheap.
@@ -116,6 +117,11 @@ struct vout_thread_sys_t
 
     /* */
     bool            is_late_dropped;
+
+    struct {
+        vlc_tick_t  max_delay;
+        vout_live_edge_state_t state;
+    } live_edge;
 
     /* Video filter2 chain */
     struct {

@@ -1579,7 +1579,7 @@ static int Demux( demux_t *p_demux )
         if( p_sys->b_live_timestamps &&
             p_sys->i_last_data_time != VLC_TICK_INVALID )
         {
-            const vlc_tick_t i_now = vlc_tick_now();
+            const vlc_tick_t i_now = mdate();
             const vlc_tick_t i_gap = i_now - p_sys->i_last_data_time;
 
             if( i_gap < p_sys->i_live_gap_timeout )
@@ -2046,15 +2046,16 @@ static void StreamRead( void *p_private, unsigned int i_size,
     vlc_tick_t i_pts = i_raw_pts;
     if( p_sys->b_live_timestamps && tk->sub->rtpSource() != NULL )
     {
-        const vlc_tick_t i_now = vlc_tick_now();
+        const vlc_tick_t i_now = mdate();
 
         if( p_sys->i_last_data_time != VLC_TICK_INVALID &&
             i_now - p_sys->i_last_data_time >= LIVE_GAP_RECOVERY_THRESHOLD )
         {
             const vlc_tick_t i_gap = i_now - p_sys->i_last_data_time;
             msg_Warn( p_demux,
-                      "live RTP resumed after %" PRId64 " ms; resetting the local "
-                      "timeline in the current RTSP session",
+                      "live RTP resumed reason=gap-recovery gap=%" PRId64
+                      " ms; resetting the local timeline in the current RTSP "
+                      "session",
                       MS_FROM_VLC_TICK( i_gap ) );
             es_out_Control( p_demux->out, ES_OUT_RESET_PCR );
             p_sys->i_pcr = VLC_TICK_INVALID;
@@ -2359,7 +2360,7 @@ static void StreamRead( void *p_private, unsigned int i_size,
     p_sys->i_no_data_ti = 0;
     if( p_sys->b_live_timestamps )
     {
-        p_sys->i_last_data_time = vlc_tick_now();
+        p_sys->i_last_data_time = mdate();
         p_sys->i_last_gap_log_time = VLC_TICK_INVALID;
     }
 }
