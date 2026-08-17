@@ -102,6 +102,18 @@ picture_t *picture_fifo_Peek(picture_fifo_t *fifo)
 
     return picture;
 }
+size_t picture_fifo_GetCount(picture_fifo_t *fifo)
+{
+    size_t count = 0;
+
+    vlc_mutex_lock(&fifo->lock);
+    for (picture_t *picture = fifo->first; picture != NULL;
+         picture = picture->p_next)
+        count++;
+    vlc_mutex_unlock(&fifo->lock);
+
+    return count;
+}
 void picture_fifo_Flush(picture_fifo_t *fifo, vlc_tick_t date, bool flush_before)
 {
     picture_t *picture;
@@ -145,4 +157,3 @@ void picture_fifo_Delete(picture_fifo_t *fifo)
     vlc_mutex_destroy(&fifo->lock);
     free(fifo);
 }
-

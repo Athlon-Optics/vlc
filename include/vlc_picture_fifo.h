@@ -67,6 +67,11 @@ VLC_API picture_t * picture_fifo_Pop( picture_fifo_t * ) VLC_USED;
 VLC_API picture_t * picture_fifo_Peek( picture_fifo_t * ) VLC_USED;
 
 /**
+ * Returns the number of pictures currently queued in the fifo.
+ */
+VLC_API size_t picture_fifo_GetCount( picture_fifo_t * );
+
+/**
  * It saves a picture_t into the fifo.
  */
 VLC_API void picture_fifo_Push( picture_fifo_t *, picture_t * );
@@ -86,4 +91,3 @@ VLC_API void picture_fifo_OffsetDate( picture_fifo_t *, vlc_tick_t delta );
 
 
 #endif /* VLC_PICTURE_FIFO_H */
-
